@@ -204,7 +204,7 @@ with st.sidebar:
     library_name = st.text_input("Library Name", value="Documents", placeholder="e.g. Notifications")
 
     st.markdown("---")
-    max_files = st.slider("Max PDFs to scan", 10, 500, 100, 10)
+    max_files = st.slider("Max PDFs to scan", 10, 5000, 100, 10)
     st.caption(f"Scanning up to **{max_files}** files per search")
 
     st.markdown("---")
