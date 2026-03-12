@@ -13,11 +13,12 @@ from msal import PublicClientApplication
 # Add in Streamlit Cloud → App → Settings → Secrets
 # ======================
 AZURE_CLIENT_ID     = st.secrets["AZURE_CLIENT_ID"]
-AZURE_TENANT_ID     = st.secrets["AZURE_TENANT_ID"]
 SHAREPOINT_SITE_URL = st.secrets["SHAREPOINT_SITE_URL"]
 SHAREPOINT_LIBRARY  = st.secrets.get("SHAREPOINT_LIBRARY", "Documents")
 
-AUTHORITY = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+# Use "organizations" so any work/school Microsoft account can sign in
+# regardless of which tenant the app registration lives in
+AUTHORITY = "https://login.microsoftonline.com/organizations"
 SCOPES    = ["Sites.Read.All", "Files.Read.All", "User.Read"]
 GRAPH     = "https://graph.microsoft.com/v1.0"
 
