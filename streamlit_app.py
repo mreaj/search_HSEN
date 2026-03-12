@@ -286,30 +286,40 @@ if "code" in query_params and st.session_state.token is None:
 if not st.session_state.token:
     auth_url = get_auth_url()
 
-    # Must use window.top.location to break out of Streamlit iframe sandbox
-    # A plain <a> tag or meta refresh gets blocked by the sandbox
-    st.markdown(f'''
-    <div class="login-card">
-        <div class="login-title">Document Search</div>
-        <div class="login-sub">
-            Sign in with your Vestas Microsoft account<br>
-            to search the SharePoint document library.
-        </div>
-        <button onclick="window.top.location.href=\'{auth_url}\'" style="
-            display: inline-block;
-            background: #1a1a1a;
-            color: #f5f2eb;
-            font-family: DM Mono, monospace;
-            font-size: 0.82rem;
-            letter-spacing: 0.07em;
-            border: none;
-            cursor: pointer;
-            padding: 0.65rem 1.8rem;
-            border-radius: 2px;
-            margin-top: 0.5rem;
-        ">Sign in with Microsoft →</button>
+    # Use st.components.v1.html to fully escape Streamlit iframe sandbox
+    # This renders in its own iframe with allow-top-navigation enabled
+    import streamlit.components.v1 as components
+    components.html(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@800&family=DM+Mono:wght@400&display=swap" rel="stylesheet">
+    <style>
+        body {{ margin: 0; background: #f5f2eb; display: flex; justify-content: center; padding-top: 4rem; }}
+        .card {{ background: #fff; border: 1px solid #e0ddd5; border-radius: 6px;
+            padding: 2.5rem 3rem; text-align: center; max-width: 400px; width: 100%; }}
+        .title {{ font-family: Syne, sans-serif; font-weight: 800; font-size: 1.6rem;
+            color: #1a1a1a; letter-spacing: -0.03em; margin-bottom: 0.4rem; }}
+        .sub {{ font-family: DM Mono, monospace; font-size: 0.72rem;
+            color: #999; margin-bottom: 1.8rem; line-height: 1.6; }}
+        .btn {{ display: inline-block; background: #1a1a1a; color: #f5f2eb;
+            font-family: DM Mono, monospace; font-size: 0.82rem; letter-spacing: 0.07em;
+            text-decoration: none; padding: 0.65rem 1.8rem;
+            border-radius: 2px; cursor: pointer; }}
+        .btn:hover {{ background: #333; }}
+    </style>
+    </head>
+    <body>
+    <div class="card">
+        <div class="title">Document Search</div>
+        <div class="sub">Sign in with your Vestas Microsoft account<br>to search the SharePoint document library.</div>
+        <a class="btn" href="{auth_url}" onclick="window.top.location.href='{auth_url}'; return false;">
+            Sign in with Microsoft →
+        </a>
     </div>
-    ''', unsafe_allow_html=True)
+    </body>
+    </html>
+    """, height=280)
     st.stop()
 
 # ======================
