@@ -284,30 +284,32 @@ if "code" in query_params and st.session_state.token is None:
 # NOT LOGGED IN
 # ======================
 if not st.session_state.token:
-    st.markdown("""
+    auth_url = get_auth_url()
+
+    # Must use window.top.location to break out of Streamlit iframe sandbox
+    # A plain <a> tag or meta refresh gets blocked by the sandbox
+    st.markdown(f'''
     <div class="login-card">
         <div class="login-title">Document Search</div>
         <div class="login-sub">
             Sign in with your Vestas Microsoft account<br>
             to search the SharePoint document library.
         </div>
+        <button onclick="window.top.location.href=\'{auth_url}\'" style="
+            display: inline-block;
+            background: #1a1a1a;
+            color: #f5f2eb;
+            font-family: DM Mono, monospace;
+            font-size: 0.82rem;
+            letter-spacing: 0.07em;
+            border: none;
+            cursor: pointer;
+            padding: 0.65rem 1.8rem;
+            border-radius: 2px;
+            margin-top: 0.5rem;
+        ">Sign in with Microsoft →</button>
     </div>
-    """, unsafe_allow_html=True)
-
-    c1, c2, c3 = st.columns([2.2, 1, 2.2])
-    with c2:
-        if st.button("Sign in with Microsoft", use_container_width=True):
-            auth_url = get_auth_url()
-            st.markdown(
-                f'<meta http-equiv="refresh" content="0; url={auth_url}">',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                f'<p style="font-family:DM Mono,monospace;font-size:0.7rem;'
-                f'color:#999;text-align:center;">Redirecting… '
-                f'<a href="{auth_url}" style="color:#e8c547;">click here if not redirected</a></p>',
-                unsafe_allow_html=True,
-            )
+    ''', unsafe_allow_html=True)
     st.stop()
 
 # ======================
