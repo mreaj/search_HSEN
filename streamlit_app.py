@@ -4,6 +4,25 @@ import io
 import requests
 import pandas as pd
 import fitz  # PyMuPDF
+from msal import ConfidentialClientApplication
+
+# ======================
+# ⚙️  CONFIGURATION — loaded from Streamlit Secrets (never hardcoded)
+# Add these in: Streamlit Cloud → App → Settings → Secrets
+# ======================
+AZURE_CLIENT_ID     = st.secrets["AZURE_CLIENT_ID"]
+AZURE_CLIENT_SECRET = st.secrets["AZURE_CLIENT_SECRET"]
+AZURE_TENANT_ID     = st.secrets["AZURE_TENANT_ID"]
+REDIRECT_URI        = st.secrets["REDIRECT_URI"]
+SHAREPOINT_SITE_URL = st.secrets["SHAREPOINT_SITE_URL"]
+SHAREPOINT_LIBRARY  = st.secrets.get("SHAREPOINT_LIBRARY", "Documents")
+
+# ======================
+# AUTH CONSTANTS
+# ======================
+AUTHORITY   = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}"
+SCOPES      = ["Sites.Read.All", "Files.Read.All", "User.Read"]
+GRAPH       = "https://graph.microsoft.com/v1.0"
 
 # ======================
 # PAGE CONFIG
@@ -53,6 +72,20 @@ st.markdown("""
     .sec-label { font-family: 'DM Mono', monospace; font-size: 0.62rem; color: #888;
         text-transform: uppercase; letter-spacing: 0.12em; margin-bottom: 0.4rem; margin-top: 1rem; }
 
+    .login-card { background: #fff; border: 1px solid #e0ddd5; border-radius: 6px;
+        padding: 2.5rem 3rem; text-align: center; max-width: 420px;
+        margin: 8rem auto 0; }
+    .login-title { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 1.6rem;
+        color: #1a1a1a; letter-spacing: -0.03em; margin-bottom: 0.4rem; }
+    .login-sub { font-family: 'DM Mono', monospace; font-size: 0.72rem;
+        color: #999; margin-bottom: 1.8rem; line-height: 1.6; }
+
+    .user-pill { background: #262626; border-radius: 3px; padding: 0.35rem 0.75rem;
+        font-family: 'DM Mono', monospace; font-size: 0.65rem; color: #888;
+        display: flex; align-items: center; gap: 0.4rem; margin-bottom: 1rem; }
+    .user-dot { width: 6px; height: 6px; border-radius: 50%;
+        background: #4caf50; flex-shrink: 0; }
+
     .result-card { background: #fff; border: 1px solid #e0ddd5; border-radius: 4px;
         padding: 1rem 1.2rem; margin-bottom: 0.55rem; position: relative; }
     .result-card::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0;
@@ -99,6 +132,8 @@ st.markdown("""
         color: #888 !important; text-transform: uppercase; letter-spacing: 0.08em; }
     .stRadio label { font-size: 0.78rem !important; color: #1a1a1a !important;
         text-transform: none !important; letter-spacing: 0 !important; }
+    .stCheckbox label { font-size: 0.78rem !important; color: #1a1a1a !important;
+        text-transform: none !important; letter-spacing: 0 !important; }
 
     .stProgress > div > div { background: #e8c547 !important; }
 
@@ -128,52 +163,93 @@ DEFAULT_KEYWORDS = [
 # ======================
 # SESSION STATE
 # ======================
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "searched" not in st.session_state:
-    st.session_state.searched = False
+for k, v in [("token", None), ("user", None), ("results", []), ("searched", False)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ======================
-# SHAREPOINT FUNCTIONS (No Auth — Public Library)
+# AUTH HELPERS
 # ======================
-def get_sharepoint_files(site_url: str, library_name: str):
-    """List PDFs from a publicly accessible SharePoint document library."""
-    site_url = site_url.rstrip("/")
-    api_url = (
-        f"{site_url}/_api/web/lists/getbytitle('{library_name}')/items"
-        f"?$select=FileLeafRef,FileRef,ID"
-        f"&$filter=substringof('.pdf',FileLeafRef)"
-        f"&$top=5000"
+def get_msal_app():
+    return ConfidentialClientApplication(
+        AZURE_CLIENT_ID,
+        authority=AUTHORITY,
+        client_credential=AZURE_CLIENT_SECRET,
     )
-    headers = {"Accept": "application/json;odata=verbose"}
-    try:
-        resp = requests.get(api_url, headers=headers, timeout=30)
-        if resp.status_code == 403:
-            return [], "Access denied (403). The library may not be publicly accessible."
-        if resp.status_code == 404:
-            return [], f"Library '{library_name}' not found (404). Check the library name."
-        resp.raise_for_status()
-        items = resp.json().get("d", {}).get("results", [])
-        return [
-            {"name": it.get("FileLeafRef", ""), "server_relative_url": it.get("FileRef", "")}
-            for it in items
-        ], None
-    except Exception as e:
-        return [], str(e)
 
+def get_auth_url() -> str:
+    return get_msal_app().get_authorization_request_url(
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+        state="streamlit_auth",
+    )
 
-def download_pdf_bytes(site_url: str, server_relative_url: str):
-    """Download a PDF file from a public SharePoint library."""
-    domain = "/".join(site_url.rstrip("/").split("/")[:3])
-    file_url = domain + server_relative_url
-    try:
-        resp = requests.get(file_url, timeout=30)
-        resp.raise_for_status()
-        return resp.content, None
-    except Exception as e:
-        return None, str(e)
+def exchange_code_for_token(code: str):
+    result = get_msal_app().acquire_token_by_authorization_code(
+        code=code,
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+    )
+    return result if "access_token" in result else None
 
+def gh(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
+# ======================
+# GRAPH API HELPERS
+# ======================
+@st.cache_data(show_spinner=False, ttl=300)
+def get_site_and_drive(token: str):
+    """Resolve SharePoint site → drive ID in one go."""
+    # 1. Site ID
+    parts = SHAREPOINT_SITE_URL.replace("https://", "").split("/", 1)
+    host, path = parts[0], parts[1] if len(parts) > 1 else ""
+    r = requests.get(f"{GRAPH}/sites/{host}:/{path}", headers=gh(token))
+    r.raise_for_status()
+    site_id = r.json()["id"]
+
+    # 2. Drive ID — match by library name
+    r = requests.get(f"{GRAPH}/sites/{site_id}/drives", headers=gh(token))
+    r.raise_for_status()
+    drives = r.json().get("value", [])
+    drive_id = None
+    for d in drives:
+        if d.get("name", "").lower() == SHAREPOINT_LIBRARY.lower():
+            drive_id = d["id"]
+            break
+    if not drive_id and drives:
+        drive_id = drives[0]["id"]   # fallback: first drive
+
+    return site_id, drive_id
+
+def list_pdf_files(token: str, drive_id: str) -> list:
+    files, url = [], f"{GRAPH}/drives/{drive_id}/root/children?$top=999"
+    while url:
+        r = requests.get(url, headers=gh(token))
+        r.raise_for_status()
+        data = r.json()
+        for item in data.get("value", []):
+            if item.get("name", "").lower().endswith(".pdf"):
+                files.append({
+                    "name":         item["name"],
+                    "id":           item["id"],
+                    "web_url":      item.get("webUrl", ""),
+                    "download_url": item.get("@microsoft.graph.downloadUrl", ""),
+                })
+        url = data.get("@odata.nextLink")
+    return files
+
+def download_pdf(file_item: dict, token: str):
+    dl = file_item.get("download_url")
+    if dl:
+        r = requests.get(dl, timeout=30)
+        if r.status_code == 200:
+            return r.content
+    return None
+
+# ======================
+# PDF HELPER
+# ======================
 def extract_text(pdf_bytes: bytes) -> str:
     text = ""
     try:
@@ -184,36 +260,87 @@ def extract_text(pdf_bytes: bytes) -> str:
         pass
     return text
 
-
-def build_file_url(site_url: str, server_relative_url: str) -> str:
-    domain = "/".join(site_url.rstrip("/").split("/")[:3])
-    return domain + server_relative_url
-
+# ======================
+# HANDLE OAUTH CALLBACK
+# ======================
+query_params = st.query_params
+if "code" in query_params and st.session_state.token is None:
+    with st.spinner("Signing you in…"):
+        result = exchange_code_for_token(query_params["code"])
+    if result:
+        st.session_state.token = result["access_token"]
+        claims = result.get("id_token_claims", {})
+        st.session_state.user = {
+            "name":  claims.get("name", ""),
+            "email": claims.get("preferred_username", ""),
+        }
+        st.query_params.clear()
+        st.rerun()
+    else:
+        st.error("Authentication failed — please try signing in again.")
+        st.query_params.clear()
 
 # ======================
-# SIDEBAR
+# NOT LOGGED IN
+# ======================
+if not st.session_state.token:
+    st.markdown("""
+    <div class="login-card">
+        <div class="login-title">Document Search</div>
+        <div class="login-sub">
+            Sign in with your Vestas Microsoft account<br>
+            to search the SharePoint document library.
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([2.2, 1, 2.2])
+    with c2:
+        if st.button("Sign in with Microsoft", use_container_width=True):
+            auth_url = get_auth_url()
+            st.markdown(
+                f'<meta http-equiv="refresh" content="0; url={auth_url}">',
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f'<p style="font-family:DM Mono,monospace;font-size:0.7rem;'
+                f'color:#999;text-align:center;">Redirecting… '
+                f'<a href="{auth_url}" style="color:#e8c547;">click here if not redirected</a></p>',
+                unsafe_allow_html=True,
+            )
+    st.stop()
+
+# ======================
+# SIDEBAR  (authenticated)
 # ======================
 with st.sidebar:
     st.markdown('<div class="logo">DOC<span>.</span><br>SCAN</div>', unsafe_allow_html=True)
     st.markdown('<div class="logo-sub">SharePoint PDF Search</div>', unsafe_allow_html=True)
 
-    site_url = st.text_input(
-        "Site URL",
-        placeholder="https://contoso.sharepoint.com/sites/YourSite"
+    name  = st.session_state.user.get("name", "")
+    email = st.session_state.user.get("email", "")
+    st.markdown(
+        f'<div class="user-pill"><div class="user-dot"></div>{name or email}</div>',
+        unsafe_allow_html=True,
     )
-    library_name = st.text_input("Library Name", value="Documents", placeholder="e.g. Notifications")
-
-    st.markdown("---")
-    max_files = st.slider("Max PDFs to scan", 10, 5000, 100, 10)
-    st.caption(f"Scanning up to **{max_files}** files per search")
+    if st.button("Sign out", use_container_width=True):
+        for k in ["token", "user", "results", "searched"]:
+            st.session_state[k] = None if k in ("token", "user") else ([] if k == "results" else False)
+        st.rerun()
 
     st.markdown("---")
     st.markdown(
-        '<span style="font-family:DM Mono,monospace;font-size:0.62rem;color:#444;line-height:1.6;">'
-        'No login required.<br>Library must be set to<br>public / anonymous access.'
-        '</span>',
-        unsafe_allow_html=True
+        f'<div style="font-family:DM Mono,monospace;font-size:0.6rem;color:#555;">'
+        f'SITE<br>'
+        f'<span style="color:#888;word-break:break-all;">{SHAREPOINT_SITE_URL}</span><br><br>'
+        f'LIBRARY<br>'
+        f'<span style="color:#888;">{SHAREPOINT_LIBRARY}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
+    st.markdown("---")
+    max_files = st.slider("Max PDFs to scan", 10, 500, 100, 10)
+    st.caption(f"Scanning up to **{max_files}** files per search")
 
 # ======================
 # MAIN
@@ -227,7 +354,6 @@ with col_left:
     st.markdown('<div class="sec-label">Event Numbers — one per line</div>', unsafe_allow_html=True)
     event_numbers_raw = st.text_area("event_numbers", value="\n".join(DEFAULT_EVENT_NUMBERS),
                                       height=155, label_visibility="collapsed")
-
     st.markdown('<div class="sec-label">Description Keywords — one per line</div>', unsafe_allow_html=True)
     keywords_raw = st.text_area("keywords", value="\n".join(DEFAULT_KEYWORDS),
                                  height=155, label_visibility="collapsed")
@@ -236,7 +362,6 @@ with col_right:
     st.markdown('<div class="sec-label">Free Text Search</div>', unsafe_allow_html=True)
     free_text_query = st.text_input("free_text", placeholder="Any word or phrase...",
                                      label_visibility="collapsed")
-
     st.markdown('<div class="sec-label" style="margin-top:1.5rem;">Match Logic</div>', unsafe_allow_html=True)
     match_logic = st.radio("match_logic",
                             ["Match ANY criteria (OR)", "Match ALL criteria (AND)"],
@@ -245,7 +370,7 @@ with col_right:
 
     st.markdown('<div class="sec-label" style="margin-top:1.5rem;">Export Format</div>', unsafe_allow_html=True)
     export_excel = st.checkbox("Excel (.xlsx)", value=True)
-    export_csv = st.checkbox("CSV (.csv)")
+    export_csv   = st.checkbox("CSV (.csv)")
 
 st.markdown("---")
 run_btn = st.button("▶  Run Search")
@@ -254,68 +379,71 @@ run_btn = st.button("▶  Run Search")
 # SEARCH
 # ======================
 if run_btn:
-    if not site_url.strip():
-        st.error("Please enter the SharePoint Site URL in the sidebar.")
+    token = st.session_state.token
+
+    ev_list   = [e.strip() for e in event_numbers_raw.splitlines() if e.strip()]
+    kw_list   = [k.strip() for k in keywords_raw.splitlines()      if k.strip()]
+    free_text = free_text_query.strip()
+
+    ev_pat = re.compile(r"\b(" + "|".join(re.escape(n) for n in ev_list) + r")\b") if ev_list else None
+    kw_pat = re.compile("|".join(re.escape(k) for k in kw_list), re.IGNORECASE)    if kw_list else None
+
+    try:
+        with st.spinner("Connecting to SharePoint…"):
+            site_id, drive_id = get_site_and_drive(token)
+
+        with st.spinner("Fetching file list…"):
+            files = list_pdf_files(token, drive_id)
+    except requests.HTTPError as e:
+        st.error(f"SharePoint error: {e.response.status_code} — {e.response.text[:200]}")
+        st.stop()
+
+    if not files:
+        st.warning("No PDF files found in that library.")
     else:
-        event_numbers = [e.strip() for e in event_numbers_raw.splitlines() if e.strip()]
-        keywords = [k.strip() for k in keywords_raw.splitlines() if k.strip()]
-        free_text = free_text_query.strip()
+        total   = min(len(files), max_files)
+        prog    = st.progress(0)
+        status  = st.empty()
+        results = []
 
-        ev_pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in event_numbers) + r")\b") if event_numbers else None
-        kw_pattern = re.compile("|".join(re.escape(k) for k in keywords), re.IGNORECASE) if keywords else None
+        for i, f in enumerate(files[:total]):
+            status.markdown(
+                f'<span style="font-family:DM Mono,monospace;font-size:0.7rem;color:#999;">'
+                f'[{i+1}/{total}] {f["name"]}</span>', unsafe_allow_html=True
+            )
+            prog.progress((i + 1) / total)
 
-        with st.spinner("Fetching file list from SharePoint..."):
-            files, err = get_sharepoint_files(site_url.strip(), library_name.strip())
+            pdf_bytes = download_pdf(f, token)
+            if not pdf_bytes:
+                continue
 
-        if err:
-            st.error(f"Error: {err}")
-        elif not files:
-            st.warning("No PDF files found in that library.")
-        else:
-            total = min(len(files), max_files)
-            prog = st.progress(0)
-            status = st.empty()
-            results = []
+            text    = extract_text(pdf_bytes)
+            m_ev    = list(set(ev_pat.findall(text)))                           if ev_pat    else []
+            m_kw    = list(set(m.lower() for m in kw_pat.findall(text)))        if kw_pat    else []
+            m_ft    = bool(re.search(re.escape(free_text), text, re.IGNORECASE)) if free_text else False
 
-            for i, f in enumerate(files[:total]):
-                status.markdown(
-                    f'<span style="font-family:DM Mono,monospace;font-size:0.7rem;color:#999;">'
-                    f'[{i+1}/{total}] {f["name"]}</span>', unsafe_allow_html=True
-                )
-                prog.progress((i + 1) / total)
+            if require_all:
+                checks = []
+                if ev_pat:    checks.append(bool(m_ev))
+                if kw_pat:    checks.append(bool(m_kw))
+                if free_text: checks.append(m_ft)
+                matched = all(checks) if checks else False
+            else:
+                matched = bool(m_ev) or bool(m_kw) or m_ft
 
-                pdf_bytes, _ = download_pdf_bytes(site_url.strip(), f["server_relative_url"])
-                if not pdf_bytes:
-                    continue
+            if matched:
+                results.append({
+                    "File Name":             f["name"],
+                    "SharePoint URL":        f["web_url"],
+                    "Matched Event Numbers": ", ".join(m_ev),
+                    "Matched Keywords":      ", ".join(m_kw),
+                    "Free Text Match":       "Yes" if m_ft else "",
+                    "_ev": m_ev, "_kw": m_kw, "_ft": m_ft,
+                })
 
-                text = extract_text(pdf_bytes)
-                m_events = list(set(ev_pattern.findall(text))) if ev_pattern else []
-                m_kws = list(set(m.lower() for m in kw_pattern.findall(text))) if kw_pattern else []
-                m_free = bool(re.search(re.escape(free_text), text, re.IGNORECASE)) if free_text else False
-
-                if require_all:
-                    checks = []
-                    if ev_pattern: checks.append(bool(m_events))
-                    if kw_pattern: checks.append(bool(m_kws))
-                    if free_text: checks.append(m_free)
-                    matched = all(checks) if checks else False
-                else:
-                    matched = bool(m_events) or bool(m_kws) or m_free
-
-                if matched:
-                    results.append({
-                        "File Name": f["name"],
-                        "URL": build_file_url(site_url.strip(), f["server_relative_url"]),
-                        "Matched Event Numbers": ", ".join(m_events),
-                        "Matched Keywords": ", ".join(m_kws),
-                        "Free Text Match": "Yes" if m_free else "",
-                        "_ev": m_events, "_kw": m_kws, "_ft": m_free,
-                    })
-
-            prog.empty()
-            status.empty()
-            st.session_state.results = results
-            st.session_state.searched = True
+        prog.empty(); status.empty()
+        st.session_state.results  = results
+        st.session_state.searched = True
 
 # ======================
 # RESULTS
@@ -329,7 +457,7 @@ if st.session_state.searched:
         st.markdown(
             '<div style="text-align:center;padding:3rem;font-family:DM Mono,monospace;'
             'font-size:0.82rem;color:#aaa;">No matching documents found.</div>',
-            unsafe_allow_html=True
+            unsafe_allow_html=True,
         )
     else:
         n_ev = sum(1 for r in results if r["_ev"])
@@ -342,26 +470,24 @@ if st.session_state.searched:
             f'<div class="stat-pill"><div class="stat-num">{n_ev}</div><div class="stat-lbl">Event hits</div></div>'
             f'<div class="stat-pill"><div class="stat-num">{n_kw}</div><div class="stat-lbl">Keyword hits</div></div>'
             f'<div class="stat-pill"><div class="stat-num">{n_ft}</div><div class="stat-lbl">Free text hits</div></div>'
-            f'</div>', unsafe_allow_html=True
+            f'</div>', unsafe_allow_html=True,
         )
 
-        # Export buttons
         export_df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in results])
         ec1, ec2, _ = st.columns([1, 1, 6])
         if export_excel:
             buf = io.BytesIO()
             export_df.to_excel(buf, index=False)
-            ec1.download_button("⬇ Excel", data=buf.getvalue(),
-                                file_name="search_results.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            ec1.download_button("⬇ Excel", data=buf.getvalue(), file_name="results.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         if export_csv:
             ec2.download_button("⬇ CSV", data=export_df.to_csv(index=False).encode(),
-                                file_name="search_results.csv", mime="text/csv")
+                file_name="results.csv", mime="text/csv")
 
         st.markdown('<div class="sec-label" style="margin-top:1rem;margin-bottom:0.7rem;">Matched Files</div>', unsafe_allow_html=True)
 
         for r in results:
-            badges = "".join(f'<span class="badge badge-ev">{ev}</span>' for ev in r["_ev"])
+            badges  = "".join(f'<span class="badge badge-ev">{ev}</span>' for ev in r["_ev"])
             badges += "".join(f'<span class="badge badge-kw">{kw}</span>' for kw in r["_kw"])
             if r["_ft"]:
                 badges += '<span class="badge badge-ft">free text ✓</span>'
@@ -370,6 +496,6 @@ if st.session_state.searched:
             <div class="result-card">
                 <div class="result-filename">📄 {r["File Name"]}</div>
                 <div class="badge-row">{badges}</div>
-                <a class="dl-link" href="{r["URL"]}" target="_blank">Open / Download ↗</a>
+                <a class="dl-link" href="{r["SharePoint URL"]}" target="_blank">Open / Download ↗</a>
             </div>
             """, unsafe_allow_html=True)
