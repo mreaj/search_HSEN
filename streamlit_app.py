@@ -150,70 +150,177 @@ def _encode_share_url(share_url: str) -> str:
     return f"u!{b64}"
 
 
-def fetch_shared_folder(share_url: str) -> tuple[list[tuple[str, bytes]], list[str]]:
-    """
-    Fetch all supported files from a public OneDrive / SharePoint shared folder URL.
-    Returns (file_pairs, errors) where file_pairs = [(filename, bytes), ...]
-    """
-    import requests
+def _is_likely_html(data: bytes) -> bool:
+    """Return True if the bytes look like an HTML page rather than a binary file."""
+    try:
+        sniff = data[:512].decode("utf-8", errors="ignore").lower()
+        return "<html" in sniff or "<!doctype" in sniff or "<head" in sniff
+    except Exception:
+        return False
 
-    token   = _encode_share_url(share_url)
-    headers = {"Accept": "application/json"}
-    results = []
-    errors  = []
 
-    # First try: Graph API anonymous shares endpoint
-    api_url = f"https://graph.microsoft.com/v1.0/shares/{token}/driveItem"
-    r = requests.get(api_url, headers=headers, timeout=20)
-    item = r.json()
+def _download_file(url: str, session, timeout: int = 60) -> bytes | None:
+    """Download a URL and return bytes, or None if it looks like HTML."""
+    try:
+        r = session.get(url, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+        data = r.content
+        if _is_likely_html(data):
+            return None
+        return data
+    except Exception as e:
+        logger.warning(f"Download error {url}: {e}")
+        return None
+
+
+def _try_graph_api(share_url: str, session) -> tuple[list, list, bool]:
+    """
+    Attempt to list / download files via the Graph API anonymous shares endpoint.
+    Returns (file_pairs, errors, succeeded).
+    """
+    token    = _encode_share_url(share_url)
+    api_base = f"https://graph.microsoft.com/v1.0/shares/{token}"
+    results, errors = [], []
+
+    try:
+        r    = session.get(f"{api_base}/driveItem", timeout=20)
+        item = r.json()
+    except Exception as e:
+        return [], [f"Graph API unreachable: {e}"], False
 
     if "error" in item:
-        # Fallback: try fetching as a direct download link (single-file share)
-        try:
-            r2 = requests.get(share_url, timeout=30, allow_redirects=True)
-            cd = r2.headers.get("Content-Disposition", "")
-            fname_match = re.search(r'filename[^;=\n]*=[\'""]?([^\'""\n;]+)', cd)
-            fname = fname_match.group(1).strip() if fname_match else "document.pdf"
-            ext   = Path(fname).suffix.lower()
-            if ext in SUPPORTED_EXTS:
-                results.append((fname, r2.content))
-            else:
-                errors.append(f"File type {ext} not supported")
-        except Exception as e:
-            errors.append(f"Could not fetch link: {e}")
-        return results, errors
+        logger.info(f"Graph API error: {item['error'].get('message','')}")
+        return [], [], False   # signal: try other strategies
 
-    # It's a folder — list children
-    if item.get("folder"):
-        children_url = f"https://graph.microsoft.com/v1.0/shares/{token}/driveItem/children"
-        while children_url:
-            cr   = requests.get(children_url, headers=headers, timeout=20)
-            data = cr.json()
-            for child in data.get("value", []):
-                if "file" in child:
-                    ext = Path(child["name"]).suffix.lower()
-                    if ext in SUPPORTED_EXTS:
-                        dl = child.get("@microsoft.graph.downloadUrl", "")
-                        if dl:
-                            try:
-                                content = requests.get(dl, timeout=60).content
-                                results.append((child["name"], content))
-                            except Exception as e:
-                                errors.append(f"Download failed for {child['name']}: {e}")
-            children_url = data.get("@odata.nextLink")
-    # It's a single file
-    elif "file" in item:
+    # ── Single-file share ──
+    if "file" in item:
         ext = Path(item["name"]).suffix.lower()
-        if ext in SUPPORTED_EXTS:
-            dl = item.get("@microsoft.graph.downloadUrl", "")
-            if dl:
-                try:
-                    content = requests.get(dl, timeout=60).content
-                    results.append((item["name"], content))
-                except Exception as e:
-                    errors.append(f"Download failed: {e}")
+        if ext not in SUPPORTED_EXTS:
+            return [], [f"Unsupported file type: {ext}"], True
+        dl = item.get("@microsoft.graph.downloadUrl", "")
+        if dl:
+            data = _download_file(dl, session)
+            if data:
+                results.append((item["name"], data))
+            else:
+                errors.append(f"Downloaded {item['name']} looks like HTML — link may have expired")
+        return results, errors, True
 
+    # ── Folder share ──
+    children_url = f"{api_base}/driveItem/children"
+    while children_url:
+        try:
+            cr   = session.get(children_url, timeout=20)
+            data = cr.json()
+        except Exception as e:
+            errors.append(f"Could not list folder: {e}")
+            break
+        for child in data.get("value", []):
+            if "file" not in child:
+                continue
+            ext = Path(child["name"]).suffix.lower()
+            if ext not in SUPPORTED_EXTS:
+                continue
+            dl = child.get("@microsoft.graph.downloadUrl", "")
+            if not dl:
+                errors.append(f"No download URL for {child['name']}")
+                continue
+            content = _download_file(dl, session)
+            if content:
+                results.append((child["name"], content))
+            else:
+                errors.append(f"{child['name']}: download returned HTML (link may have expired)")
+        children_url = data.get("@odata.nextLink")
+
+    return results, errors, True
+
+
+def _try_direct_download(share_url: str, session) -> tuple[list, list]:
+    """
+    Try the share URL itself as a direct file download.
+    Works for single-file "download" links that end in ?download=1 etc.
+    """
+    results, errors = [], []
+    try:
+        # Append download=1 if not already present
+        dl_url = share_url
+        if "download=1" not in dl_url:
+            sep    = "&" if "?" in dl_url else "?"
+            dl_url = dl_url + sep + "download=1"
+
+        r = session.get(dl_url, timeout=30, allow_redirects=True)
+        r.raise_for_status()
+        data = r.content
+
+        if _is_likely_html(data):
+            errors.append("Link redirected to a web page — not a direct file URL")
+            return results, errors
+
+        # Guess filename from Content-Disposition or URL
+        cd    = r.headers.get("Content-Disposition", "")
+        match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\'\n;]+)', cd, re.IGNORECASE)
+        if match:
+            fname = match.group(1).strip().strip('"\'')
+        else:
+            fname = Path(share_url.split("?")[0].rstrip("/")).name or "document"
+        if not Path(fname).suffix:
+            # Guess from Content-Type
+            ct = r.headers.get("Content-Type", "")
+            if "pdf" in ct:
+                fname += ".pdf"
+            elif "word" in ct or "openxml" in ct:
+                fname += ".docx"
+
+        ext = Path(fname).suffix.lower()
+        if ext in SUPPORTED_EXTS:
+            results.append((fname, data))
+        else:
+            errors.append(f"Downloaded file has unsupported type: {ext or 'unknown'}")
+    except Exception as e:
+        errors.append(f"Direct download failed: {e}")
     return results, errors
+
+
+def fetch_shared_folder(share_url: str) -> tuple[list[tuple[str, bytes]], list[str]]:
+    """
+    Multi-strategy fetcher for OneDrive / SharePoint shared links.
+
+    Strategy order:
+      1. Microsoft Graph API anonymous shares  (works for most public OneDrive links)
+      2. Direct download with ?download=1      (works for single-file links)
+      3. Informative error with guidance
+
+    Returns (file_pairs, errors)
+    """
+    import requests
+    session = requests.Session()
+    session.headers.update({"User-Agent": "HSEBot/1.0", "Accept": "application/json"})
+
+    all_results, all_errors = [], []
+
+    # ── Strategy 1: Graph API ──────────────────────────────────────────────────
+    results, errors, graph_ok = _try_graph_api(share_url, session)
+    all_results.extend(results)
+    all_errors.extend(errors)
+
+    if graph_ok and (results or errors):
+        return all_results, all_errors   # Graph API handled it (even if 0 files found)
+
+    # ── Strategy 2: Direct download ───────────────────────────────────────────
+    logger.info("Graph API did not resolve link — trying direct download")
+    results2, errors2 = _try_direct_download(share_url, session)
+    all_results.extend(results2)
+    all_errors.extend(errors2)
+
+    if not all_results:
+        all_errors.append(
+            "Could not fetch files automatically. "
+            "SharePoint organisation links often require sign-in. "
+            "Please use the 'Upload Files' option instead: download the files from "
+            "OneDrive manually and upload them here."
+        )
+
+    return all_results, all_errors
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -255,30 +362,50 @@ def parse_pdf(filename: str, data: bytes) -> tuple[list, dict]:
     import pdfplumber
     from langchain_core.documents import Document
 
+    # Guard: reject HTML bytes masquerading as a PDF
+    if _is_likely_html(data):
+        raise ValueError(
+            f"{filename}: received an HTML page instead of a PDF. "
+            "The OneDrive link may require sign-in or has expired."
+        )
+    if len(data) < 64 or not data[:4] == b"%PDF":
+        raise ValueError(
+            f"{filename}: file does not start with %PDF — "
+            f"first bytes: {data[:16]!r}. It may be password-protected or corrupted."
+        )
+
     docs       = []
     stats      = {"pages": 0, "text_pages": 0, "tables": 0, "ocr_pages": 0}
     ocr_needed = []
 
-    with pdfplumber.open(io.BytesIO(data)) as pdf:
-        stats["pages"] = len(pdf.pages)
-        for pn, page in enumerate(pdf.pages):
-            parts = []
-            raw   = page.extract_text() or ""
-            for t in page.extract_tables():
-                md = _table_to_md(t)
-                if md:
-                    parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
-                    stats["tables"] += 1
-            if raw.strip():
-                parts.insert(0, raw.strip())
-                stats["text_pages"] += 1
-            else:
-                ocr_needed.append(pn)
-            if parts:
-                docs.append(Document(
-                    page_content="\n\n".join(parts),
-                    metadata={"source_file": filename, "page": pn},
-                ))
+    try:
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            stats["pages"] = len(pdf.pages)
+            for pn, page in enumerate(pdf.pages):
+                parts = []
+                raw   = page.extract_text() or ""
+                try:
+                    for t in page.extract_tables():
+                        md = _table_to_md(t)
+                        if md:
+                            parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
+                            stats["tables"] += 1
+                except Exception:
+                    pass   # table extraction is best-effort
+                if raw.strip():
+                    parts.insert(0, raw.strip())
+                    stats["text_pages"] += 1
+                else:
+                    ocr_needed.append(pn)
+                if parts:
+                    docs.append(Document(
+                        page_content="\n\n".join(parts),
+                        metadata={"source_file": filename, "page": pn},
+                    ))
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"{filename}: pdfplumber failed — {e}") from e
 
     if ocr_needed:
         try:
@@ -295,37 +422,71 @@ def parse_pdf(filename: str, data: bytes) -> tuple[list, dict]:
                         stats["ocr_pages"] += 1
         except Exception as e:
             logger.warning(f"OCR pass failed for {filename}: {e}")
+            stats["ocr_note"] = str(e)
 
     docs.sort(key=lambda d: d.metadata.get("page", 0))
     return docs, stats
 
 
 def parse_docx(filename: str, data: bytes) -> tuple[list, dict]:
-    import docx as _docx
     from langchain_core.documents import Document
 
-    doc   = _docx.Document(io.BytesIO(data))
-    stats = {"paragraphs": 0, "tables": 0}
-    parts = []
+    if _is_likely_html(data):
+        raise ValueError(
+            f"{filename}: received an HTML page instead of a DOCX file. "
+            "The OneDrive link may require sign-in or has expired."
+        )
+    # DOCX files are ZIP archives — check magic bytes
+    if len(data) < 4 or data[:2] != b"PK":
+        raise ValueError(
+            f"{filename}: not a valid DOCX/ZIP file — "
+            f"first bytes: {data[:8]!r}. May be corrupted or password-protected."
+        )
 
-    for block in doc.element.body:
-        tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
-        if tag == "p":
-            para = _docx.text.paragraph.Paragraph(block, doc)
-            txt  = para.text.strip()
-            if txt:
-                parts.append(txt)
-                stats["paragraphs"] += 1
-        elif tag == "tbl":
-            md = _docx_table_to_md(_docx.table.Table(block, doc))
-            if md:
-                parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
-                stats["tables"] += 1
+    try:
+        import docx as _docx
+    except ImportError:
+        try:
+            from docx import Document as _DocxDocument   # noqa: F401
+            import docx as _docx
+        except ImportError:
+            raise ImportError(
+                "python-docx is not installed. Run: pip install python-docx"
+            )
 
-    content = "\n\n".join(parts)
-    docs    = ([Document(page_content=content, metadata={"source_file": filename})]
-               if content.strip() else [])
-    return docs, stats
+    try:
+        doc   = _docx.Document(io.BytesIO(data))
+        stats = {"paragraphs": 0, "tables": 0}
+        parts = []
+
+        for block in doc.element.body:
+            tag = block.tag.split("}")[-1] if "}" in block.tag else block.tag
+            if tag == "p":
+                try:
+                    para = _docx.text.paragraph.Paragraph(block, doc)
+                    txt  = para.text.strip()
+                    if txt:
+                        parts.append(txt)
+                        stats["paragraphs"] += 1
+                except Exception:
+                    pass
+            elif tag == "tbl":
+                try:
+                    md = _docx_table_to_md(_docx.table.Table(block, doc))
+                    if md:
+                        parts.append(f"\n[TABLE]\n{md}\n[/TABLE]\n")
+                        stats["tables"] += 1
+                except Exception:
+                    pass
+
+        content = "\n\n".join(parts)
+        docs    = ([Document(page_content=content, metadata={"source_file": filename})]
+                   if content.strip() else [])
+        return docs, stats
+    except (ValueError, ImportError):
+        raise
+    except Exception as e:
+        raise ValueError(f"{filename}: python-docx failed — {e}") from e
 
 
 def parse_txt(filename: str, data: bytes) -> tuple[list, dict]:
@@ -364,15 +525,20 @@ def build_index(_file_tuples: tuple, cache_ver: int):
     for fname, fbytes in _file_tuples:
         try:
             docs, stats = dispatch_parse(fname, fbytes)
-            all_docs.extend(docs)
-            all_stats[fname] = stats
-            logger.info(f"Parsed {fname}: {len(docs)} doc(s), stats={stats}")
+            if docs:
+                all_docs.extend(docs)
+                all_stats[fname] = stats
+                logger.info(f"Parsed {fname}: {len(docs)} doc(s), stats={stats}")
+            else:
+                all_stats[fname] = {"error": "Parser returned no content — file may be empty or image-only without OCR"}
+                logger.warning(f"No content from {fname}")
         except Exception as e:
-            all_stats[fname] = {"error": str(e)}
-            logger.warning(f"Skipped {fname}: {e}")
+            err_msg = str(e)
+            all_stats[fname] = {"error": err_msg}
+            logger.warning(f"Parse failed {fname}: {err_msg}")
 
     if not all_docs:
-        return None, 0, {}
+        return None, 0, all_stats   # return stats so errors show in UI
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000, chunk_overlap=200,
@@ -674,14 +840,24 @@ with st.sidebar:
                 with st.spinner(f"Parsing & indexing {len(file_pairs)} file(s)…"):
                     st.session_state.index_ver += 1
                     vs, n, ps = build_index(tuple(file_pairs), st.session_state.index_ver)
+
+                # Always store parse stats so errors appear in the Parse Report
+                st.session_state.parse_stats = ps
+
                 if vs:
                     st.session_state.vectorstore   = vs
                     st.session_state.chunk_count   = n
                     st.session_state.indexed_files = [p[0] for p in file_pairs]
-                    st.session_state.parse_stats   = ps
                     st.success(f"✅ {n:,} chunks indexed from {len(file_pairs)} file(s)!")
                 else:
-                    st.error("Files downloaded but could not be parsed. Check they are valid PDF/DOCX.")
+                    # Show per-file errors from parse stats
+                    failed = {f: s for f, s in ps.items() if "error" in s}
+                    if failed:
+                        st.error("Files were downloaded but parsing failed. See **Parse Report** below for details.")
+                        for fname, s in failed.items():
+                            st.error(f"📄 **{fname}**: {s['error']}")
+                    else:
+                        st.error("Files downloaded but no text content was extracted. They may be image-only PDFs without OCR support installed.")
             elif not errs:
                 st.error("No supported files found at that link. Ensure the folder is public and contains PDF or DOCX files.")
 
@@ -716,15 +892,21 @@ with st.sidebar:
                 st.session_state.index_ver += 1
                 tuples = tuple((f.name, f.read()) for f in uploaded)
                 vs, n, ps = build_index(tuples, st.session_state.index_ver)
+            st.session_state.parse_stats   = ps
+            st.session_state.fetched_files = []
             if vs:
                 st.session_state.vectorstore   = vs
                 st.session_state.chunk_count   = n
                 st.session_state.indexed_files = [f.name for f in uploaded]
-                st.session_state.parse_stats   = ps
-                st.session_state.fetched_files = []
                 st.success(f"✅ {n:,} chunks indexed!")
             else:
-                st.error("Could not parse any files.")
+                failed = {f: s for f, s in ps.items() if "error" in s}
+                if failed:
+                    st.error("Parsing failed. See **Parse Report** below for details.")
+                    for fname, s in failed.items():
+                        st.error(f"📄 **{fname}**: {s['error']}")
+                else:
+                    st.error("No text content extracted. Files may be image-only PDFs (install Tesseract for OCR).")
 
     # ── Parse report ───────────────────────────────────────────────────────────
     if st.session_state.parse_stats:
