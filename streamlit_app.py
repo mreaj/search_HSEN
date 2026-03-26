@@ -141,17 +141,33 @@ hr{border-color:var(--bd)!important;}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ONEDRIVE / SHAREPOINT — SHARED LINK FETCHER
+#  MICROSOFT GRAPH — AUTHENTICATED SHAREPOINT / ONEDRIVE FETCHER
 # ═══════════════════════════════════════════════════════════════════════════════
+#
+#  Uses the Microsoft device-code OAuth flow (no Azure app registration needed
+#  for most Microsoft 365 / work accounts — uses the well-known "Office" client).
+#  Supports:
+#    • Personal OneDrive  (graph.microsoft.com/v1.0/me/drive)
+#    • SharePoint sites   (graph.microsoft.com/v1.0/sites/{site-id}/drives)
+#    • Shared links       (graph.microsoft.com/v1.0/shares/{token}/driveItem)
+#
+#  Flow in the sidebar:
+#    1. User clicks "Sign in with Microsoft"
+#    2. App shows a device code + microsoft.com/devicelogin URL
+#    3. User opens URL, enters code, signs in with their work account
+#    4. App polls for the token, then lists / downloads files
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _encode_share_url(share_url: str) -> str:
-    """Encode a share URL into the Graph API shares token format."""
-    b64 = base64.urlsafe_b64encode(share_url.encode()).decode().rstrip("=")
-    return f"u!{b64}"
+# Use the well-known Microsoft "Office" public client — works for any M365 tenant
+# without requiring the admin to register an Azure app.
+MS_CLIENT_ID   = "d3590ed6-52b3-4102-aeff-aad2292ab01c"   # Microsoft Office client
+MS_SCOPES      = "Files.Read.All Sites.Read.All offline_access"
+MS_DEVICE_URL  = "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
+MS_TOKEN_URL   = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+GRAPH          = "https://graph.microsoft.com/v1.0"
 
 
 def _is_likely_html(data: bytes) -> bool:
-    """Return True if the bytes look like an HTML page rather than a binary file."""
     try:
         sniff = data[:512].decode("utf-8", errors="ignore").lower()
         return "<html" in sniff or "<!doctype" in sniff or "<head" in sniff
@@ -159,168 +175,207 @@ def _is_likely_html(data: bytes) -> bool:
         return False
 
 
-def _download_file(url: str, session, timeout: int = 60) -> bytes | None:
-    """Download a URL and return bytes, or None if it looks like HTML."""
-    try:
-        r = session.get(url, timeout=timeout, allow_redirects=True)
-        r.raise_for_status()
-        data = r.content
-        if _is_likely_html(data):
-            return None
-        return data
-    except Exception as e:
-        logger.warning(f"Download error {url}: {e}")
-        return None
+# ── Auth helpers ──────────────────────────────────────────────────────────────
+
+def ms_start_device_flow() -> dict:
+    import requests
+    r = requests.post(MS_DEVICE_URL, data={"client_id": MS_CLIENT_ID, "scope": MS_SCOPES}, timeout=15)
+    return r.json()
 
 
-def _try_graph_api(share_url: str, session) -> tuple[list, list, bool]:
+def ms_poll_token(device_code: str) -> dict | None:
+    """Poll once. Returns token dict if ready, None if still pending, raises on hard error."""
+    import requests
+    r = requests.post(MS_TOKEN_URL, data={
+        "client_id":   MS_CLIENT_ID,
+        "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+    }, timeout=15)
+    d = r.json()
+    if "access_token" in d:
+        return d
+    err = d.get("error", "")
+    if err in ("authorization_pending", "slow_down"):
+        return None   # still waiting — caller should retry
+    raise RuntimeError(d.get("error_description", f"Auth error: {err}"))
+
+
+def ms_refresh_token(refresh_tok: str) -> dict | None:
+    import requests
+    r = requests.post(MS_TOKEN_URL, data={
+        "client_id":     MS_CLIENT_ID,
+        "grant_type":    "refresh_token",
+        "refresh_token": refresh_tok,
+        "scope":         MS_SCOPES,
+    }, timeout=15)
+    d = r.json()
+    return d if "access_token" in d else None
+
+
+def _graph_get(path: str, token: str, params: dict = None) -> dict:
+    import requests
+    url = path if path.startswith("http") else f"{GRAPH}{path}"
+    r   = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                       params=params, timeout=30)
+    return r.json()
+
+
+def _graph_download(url: str, token: str) -> bytes:
+    import requests
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                     allow_redirects=True, timeout=90)
+    r.raise_for_status()
+    return r.content
+
+
+# ── SharePoint URL parser ─────────────────────────────────────────────────────
+
+def _parse_sharepoint_url(url: str) -> tuple[str | None, str | None]:
     """
-    Attempt to list / download files via the Graph API anonymous shares endpoint.
-    Returns (file_pairs, errors, succeeded).
+    Extract (hostname, site_path) from a SharePoint URL.
+    e.g. https://vestas.sharepoint.com/sites/GlobalQHSE-hub/HSEN%20Legacy/...
+         → ("vestas.sharepoint.com", "/sites/GlobalQHSE-hub")
     """
-    token    = _encode_share_url(share_url)
-    api_base = f"https://graph.microsoft.com/v1.0/shares/{token}"
+    m = re.match(r"https?://([^/]+)((?:/sites/[^/?#]+)?)", url, re.IGNORECASE)
+    if m:
+        return m.group(1), m.group(2) or "/"
+    return None, None
+
+
+def _resolve_sharepoint_folder_path(url: str) -> str:
+    """
+    Extract the server-relative folder path from a SharePoint URL.
+    e.g. .../sites/GlobalQHSE-hub/HSEN%20Legacy/Forms/... → /sites/GlobalQHSE-hub/HSEN Legacy
+    Strips /Forms/... suffixes added by SharePoint's allitems.aspx view.
+    """
+    from urllib.parse import urlparse, unquote
+    parsed = urlparse(url)
+    path   = unquote(parsed.path)
+    # Remove trailing /Forms/HSEN.aspx style view suffixes
+    path   = re.sub(r"/Forms/[^/]*$", "", path)
+    path   = re.sub(r"/[^/]+\.aspx$", "", path)
+    return path.rstrip("/")
+
+
+# ── Main fetcher ──────────────────────────────────────────────────────────────
+
+def fetch_from_sharepoint(access_token: str, sp_url: str) -> tuple[list, list]:
+    """
+    Fetch all supported files from a SharePoint library folder using Graph API.
+    sp_url: the full SharePoint URL the user pasted (site + folder path).
+    Returns (file_pairs, errors).
+    """
     results, errors = [], []
 
-    try:
-        r    = session.get(f"{api_base}/driveItem", timeout=20)
-        item = r.json()
-    except Exception as e:
-        return [], [f"Graph API unreachable: {e}"], False
+    hostname, site_path = _parse_sharepoint_url(sp_url)
+    if not hostname:
+        return [], ["Could not parse SharePoint URL — please paste the full URL from your browser."]
 
-    if "error" in item:
-        logger.info(f"Graph API error: {item['error'].get('message','')}")
-        return [], [], False   # signal: try other strategies
+    folder_path = _resolve_sharepoint_folder_path(sp_url)
 
-    # ── Single-file share ──
-    if "file" in item:
-        ext = Path(item["name"]).suffix.lower()
-        if ext not in SUPPORTED_EXTS:
-            return [], [f"Unsupported file type: {ext}"], True
-        dl = item.get("@microsoft.graph.downloadUrl", "")
-        if dl:
-            data = _download_file(dl, session)
-            if data:
-                results.append((item["name"], data))
-            else:
-                errors.append(f"Downloaded {item['name']} looks like HTML — link may have expired")
-        return results, errors, True
+    # 1. Resolve site ID
+    site_resp = _graph_get(f"/sites/{hostname}:{site_path}", access_token)
+    if "error" in site_resp:
+        return [], [f"Could not find SharePoint site '{site_path}' on {hostname}: "
+                    f"{site_resp['error'].get('message', site_resp['error'])}"]
+    site_id = site_resp["id"]
 
-    # ── Folder share ──
-    children_url = f"{api_base}/driveItem/children"
-    while children_url:
-        try:
-            cr   = session.get(children_url, timeout=20)
-            data = cr.json()
-        except Exception as e:
-            errors.append(f"Could not list folder: {e}")
+    # 2. List drives (document libraries) for the site
+    drives_resp = _graph_get(f"/sites/{site_id}/drives", access_token)
+    drives      = drives_resp.get("value", [])
+    if not drives:
+        return [], [f"No document libraries found on site {hostname}{site_path}"]
+
+    # 3. Find the drive whose root path is a prefix of folder_path
+    #    e.g. folder_path = /sites/GlobalQHSE-hub/HSEN Legacy
+    target_drive = None
+    subfolder    = ""
+    for drive in drives:
+        # Drive webUrl looks like: https://tenant.sharepoint.com/sites/site/LibraryName
+        drive_web  = drive.get("webUrl", "")
+        drive_path = _resolve_sharepoint_folder_path(drive_web)
+        if folder_path.startswith(drive_path):
+            target_drive = drive
+            subfolder    = folder_path[len(drive_path):].lstrip("/")
             break
-        for child in data.get("value", []):
-            if "file" not in child:
-                continue
-            ext = Path(child["name"]).suffix.lower()
-            if ext not in SUPPORTED_EXTS:
-                continue
-            dl = child.get("@microsoft.graph.downloadUrl", "")
-            if not dl:
-                errors.append(f"No download URL for {child['name']}")
-                continue
-            content = _download_file(dl, session)
-            if content:
-                results.append((child["name"], content))
-            else:
-                errors.append(f"{child['name']}: download returned HTML (link may have expired)")
-        children_url = data.get("@odata.nextLink")
 
-    return results, errors, True
+    if not target_drive:
+        # Fallback: use the first drive and treat the whole path as subfolder
+        target_drive = drives[0]
+        drive_web    = target_drive.get("webUrl", "")
+        drive_path   = _resolve_sharepoint_folder_path(drive_web)
+        subfolder    = folder_path[len(drive_path):].lstrip("/") if folder_path.startswith(drive_path) else ""
 
+    drive_id = target_drive["id"]
 
-def _try_direct_download(share_url: str, session) -> tuple[list, list]:
-    """
-    Try the share URL itself as a direct file download.
-    Works for single-file "download" links that end in ?download=1 etc.
-    """
-    results, errors = [], []
-    try:
-        # Append download=1 if not already present
-        dl_url = share_url
-        if "download=1" not in dl_url:
-            sep    = "&" if "?" in dl_url else "?"
-            dl_url = dl_url + sep + "download=1"
-
-        r = session.get(dl_url, timeout=30, allow_redirects=True)
-        r.raise_for_status()
-        data = r.content
-
-        if _is_likely_html(data):
-            errors.append("Link redirected to a web page — not a direct file URL")
-            return results, errors
-
-        # Guess filename from Content-Disposition or URL
-        cd    = r.headers.get("Content-Disposition", "")
-        match = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\'\n;]+)', cd, re.IGNORECASE)
-        if match:
-            fname = match.group(1).strip().strip('"\'')
+    # 4. List files in the target folder (or root if subfolder is empty)
+    def list_folder(folder_rel_path: str):
+        if folder_rel_path:
+            url = f"{GRAPH}/drives/{drive_id}/root:/{folder_rel_path}:/children"
         else:
-            fname = Path(share_url.split("?")[0].rstrip("/")).name or "document"
-        if not Path(fname).suffix:
-            # Guess from Content-Type
-            ct = r.headers.get("Content-Type", "")
-            if "pdf" in ct:
-                fname += ".pdf"
-            elif "word" in ct or "openxml" in ct:
-                fname += ".docx"
+            url = f"{GRAPH}/drives/{drive_id}/root/children"
 
-        ext = Path(fname).suffix.lower()
-        if ext in SUPPORTED_EXTS:
-            results.append((fname, data))
-        else:
-            errors.append(f"Downloaded file has unsupported type: {ext or 'unknown'}")
-    except Exception as e:
-        errors.append(f"Direct download failed: {e}")
+        while url:
+            data = _graph_get(url, access_token)
+            if "error" in data:
+                errors.append(f"Could not list folder '{folder_rel_path}': "
+                               f"{data['error'].get('message', data['error'])}")
+                return
+            for item in data.get("value", []):
+                if "file" in item:
+                    ext = Path(item["name"]).suffix.lower()
+                    if ext not in SUPPORTED_EXTS:
+                        continue
+                    dl_url = item.get("@microsoft.graph.downloadUrl") or \
+                             f"{GRAPH}/drives/{drive_id}/items/{item['id']}/content"
+                    try:
+                        content = _graph_download(dl_url, access_token)
+                        if _is_likely_html(content):
+                            errors.append(f"{item['name']}: download returned HTML — token may have expired")
+                        else:
+                            results.append((item["name"], content))
+                    except Exception as e:
+                        errors.append(f"Download failed for {item['name']}: {e}")
+                elif "folder" in item:
+                    sub = f"{folder_rel_path}/{item['name']}" if folder_rel_path else item["name"]
+                    list_folder(sub)
+            url = data.get("@odata.nextLink")
+
+    list_folder(subfolder)
     return results, errors
 
 
-def fetch_shared_folder(share_url: str) -> tuple[list[tuple[str, bytes]], list[str]]:
-    """
-    Multi-strategy fetcher for OneDrive / SharePoint shared links.
+def fetch_from_onedrive(access_token: str, folder_path: str = "") -> tuple[list, list]:
+    """Fetch files from the signed-in user's personal OneDrive."""
+    results, errors = [], []
 
-    Strategy order:
-      1. Microsoft Graph API anonymous shares  (works for most public OneDrive links)
-      2. Direct download with ?download=1      (works for single-file links)
-      3. Informative error with guidance
+    def list_folder(rel: str):
+        url = (f"{GRAPH}/me/drive/root:/{rel}:/children" if rel
+               else f"{GRAPH}/me/drive/root/children")
+        while url:
+            data = _graph_get(url, access_token)
+            if "error" in data:
+                errors.append(f"OneDrive error: {data['error'].get('message', data['error'])}")
+                return
+            for item in data.get("value", []):
+                if "file" in item:
+                    ext = Path(item["name"]).suffix.lower()
+                    if ext not in SUPPORTED_EXTS:
+                        continue
+                    dl  = item.get("@microsoft.graph.downloadUrl", "")
+                    try:
+                        content = _graph_download(dl or
+                            f"{GRAPH}/me/drive/items/{item['id']}/content", access_token)
+                        if not _is_likely_html(content):
+                            results.append((item["name"], content))
+                    except Exception as e:
+                        errors.append(f"Download failed {item['name']}: {e}")
+                elif "folder" in item:
+                    list_folder(f"{rel}/{item['name']}" if rel else item["name"])
+            url = data.get("@odata.nextLink")
 
-    Returns (file_pairs, errors)
-    """
-    import requests
-    session = requests.Session()
-    session.headers.update({"User-Agent": "HSEBot/1.0", "Accept": "application/json"})
-
-    all_results, all_errors = [], []
-
-    # ── Strategy 1: Graph API ──────────────────────────────────────────────────
-    results, errors, graph_ok = _try_graph_api(share_url, session)
-    all_results.extend(results)
-    all_errors.extend(errors)
-
-    if graph_ok and (results or errors):
-        return all_results, all_errors   # Graph API handled it (even if 0 files found)
-
-    # ── Strategy 2: Direct download ───────────────────────────────────────────
-    logger.info("Graph API did not resolve link — trying direct download")
-    results2, errors2 = _try_direct_download(share_url, session)
-    all_results.extend(results2)
-    all_errors.extend(errors2)
-
-    if not all_results:
-        all_errors.append(
-            "Could not fetch files automatically. "
-            "SharePoint organisation links often require sign-in. "
-            "Please use the 'Upload Files' option instead: download the files from "
-            "OneDrive manually and upload them here."
-        )
-
-    return all_results, all_errors
+    list_folder(folder_path)
+    return results, errors
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -753,7 +808,11 @@ defaults = {
     "index_ver":     0,
     "parse_stats":   {},
     "pending":       "",
-    "fetched_files": [],   # list of (name, size) from last OneDrive fetch
+    "fetched_files": [],
+    # Microsoft auth
+    "ms_token":       None,   # full token dict (access_token, refresh_token, …)
+    "ms_device_flow": None,   # device-code flow dict while polling
+    "ms_user":        "",     # display name once signed in
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -807,64 +866,180 @@ with st.sidebar:
 
     # ── Document Source ────────────────────────────────────────────────────────
     st.markdown('<span class="sl">Document Source</span>', unsafe_allow_html=True)
-    source_tab = st.radio("src", ["🔗 OneDrive Share Link", "📂 Upload Files"],
+    source_tab = st.radio("src", ["☁️ SharePoint / OneDrive", "📂 Upload Files"],
                           label_visibility="collapsed")
 
-    # ════ MODE A: OneDrive shared link ════════════════════════════════════════
-    if source_tab == "🔗 OneDrive Share Link":
-        st.markdown("""
-        <div class="od-panel">
-          <div class="od-title">☁ OneDrive / SharePoint</div>
-          <div class="od-hint">
-            In OneDrive, right-click your HSE folder → <strong>Share</strong> →
-            set to <em>Anyone with the link can view</em> → copy the link and paste below.
-          </div>
-        </div>""", unsafe_allow_html=True)
+    # ════ MODE A: SharePoint / OneDrive with Microsoft sign-in ════════════════
+    if source_tab == "☁️ SharePoint / OneDrive":
 
-        share_url = st.text_input(
-            "url", placeholder="https://company.sharepoint.com/:f:/s/…",
-            label_visibility="collapsed",
-            help="Paste the public share link to your OneDrive/SharePoint folder",
-        )
+        # ── Already signed in ──────────────────────────────────────────────────
+        if st.session_state.ms_token:
+            tok = st.session_state.ms_token
+            name_display = st.session_state.ms_user or "Microsoft Account"
+            st.markdown(
+                f'<div style="font-size:12px;color:#22c55e;margin-bottom:8px">'
+                f'✅ Signed in as <strong>{name_display}</strong></div>',
+                unsafe_allow_html=True)
 
-        if share_url and st.button("⬇️  Fetch & Index Files", use_container_width=True):
-            with st.spinner("Connecting to OneDrive…"):
-                file_pairs, errs = fetch_shared_folder(share_url.strip())
+            col_sig, col_clr = st.columns(2)
+            with col_sig:
+                if st.button("🚪 Sign Out", use_container_width=True):
+                    st.session_state.ms_token       = None
+                    st.session_state.ms_device_flow = None
+                    st.session_state.ms_user        = ""
+                    st.rerun()
 
-            if errs:
-                for e in errs:
-                    st.warning(f"⚠ {e}")
+            st.markdown("""
+            <div class="od-panel">
+              <div class="od-title">📂 SharePoint Folder URL</div>
+              <div class="od-hint">
+                Navigate to your HSE folder in SharePoint, then copy the URL
+                from your browser address bar and paste it below.
+              </div>
+            </div>""", unsafe_allow_html=True)
 
-            if file_pairs:
-                st.session_state.fetched_files = [(n, len(b)) for n, b in file_pairs]
-                with st.spinner(f"Parsing & indexing {len(file_pairs)} file(s)…"):
-                    st.session_state.index_ver += 1
-                    vs, n, ps = build_index(tuple(file_pairs), st.session_state.index_ver)
+            sp_url = st.text_input(
+                "spurl",
+                placeholder="https://company.sharepoint.com/sites/GlobalQHSE-hub/HSEN Legacy",
+                label_visibility="collapsed",
+                help="Paste the SharePoint or OneDrive folder URL from your browser",
+            )
 
-                # Always store parse stats so errors appear in the Parse Report
-                st.session_state.parse_stats = ps
+            is_onedrive = sp_url and "my.sharepoint.com" in sp_url
+            is_sp       = sp_url and "sharepoint.com/sites" in sp_url
 
-                if vs:
-                    st.session_state.vectorstore   = vs
-                    st.session_state.chunk_count   = n
-                    st.session_state.indexed_files = [p[0] for p in file_pairs]
-                    st.success(f"✅ {n:,} chunks indexed from {len(file_pairs)} file(s)!")
-                else:
-                    # Show per-file errors from parse stats
-                    failed = {f: s for f, s in ps.items() if "error" in s}
-                    if failed:
-                        st.error("Files were downloaded but parsing failed. See **Parse Report** below for details.")
-                        for fname, s in failed.items():
-                            st.error(f"📄 **{fname}**: {s['error']}")
+            if sp_url and st.button("⬇️  Fetch & Index Files", use_container_width=True):
+                # Auto-refresh token if needed
+                if tok.get("refresh_token"):
+                    refreshed = ms_refresh_token(tok["refresh_token"])
+                    if refreshed:
+                        st.session_state.ms_token = refreshed
+                        tok = refreshed
+
+                access_token = tok["access_token"]
+
+                with st.spinner("Browsing SharePoint library…"):
+                    if is_onedrive:
+                        file_pairs, errs = fetch_from_onedrive(access_token, "")
                     else:
-                        st.error("Files downloaded but no text content was extracted. They may be image-only PDFs without OCR support installed.")
-            elif not errs:
-                st.error("No supported files found at that link. Ensure the folder is public and contains PDF or DOCX files.")
+                        file_pairs, errs = fetch_from_sharepoint(access_token, sp_url.strip())
+
+                if errs:
+                    for e in errs:
+                        st.warning(f"⚠ {e}")
+
+                if file_pairs:
+                    st.session_state.fetched_files = [(n, len(b)) for n, b in file_pairs]
+                    with st.spinner(f"Parsing & indexing {len(file_pairs)} file(s)…"):
+                        st.session_state.index_ver += 1
+                        vs, n, ps = build_index(tuple(file_pairs), st.session_state.index_ver)
+                    st.session_state.parse_stats = ps
+                    if vs:
+                        st.session_state.vectorstore   = vs
+                        st.session_state.chunk_count   = n
+                        st.session_state.indexed_files = [p[0] for p in file_pairs]
+                        st.success(f"✅ {n:,} chunks indexed from {len(file_pairs)} file(s)!")
+                    else:
+                        failed = {f: s for f, s in ps.items() if "error" in s}
+                        if failed:
+                            st.error("Parsing failed — see Parse Report below.")
+                            for fname, s in failed.items():
+                                st.error(f"📄 **{fname}**: {s['error']}")
+                        else:
+                            st.error("No text content extracted. Files may be image-only PDFs.")
+                elif not errs:
+                    st.warning("No PDF or DOCX files found in that folder.")
+
+        # ── Device-code flow in progress ───────────────────────────────────────
+        elif st.session_state.ms_device_flow:
+            flow = st.session_state.ms_device_flow
+            st.markdown(f"""
+            <div class="od-panel">
+              <div class="od-title">🔐 Sign in with Microsoft</div>
+              <div class="od-hint">
+                <strong>Step 1</strong> — Open this URL in your browser:<br>
+                <a href="{flow.get('verification_uri','https://microsoft.com/devicelogin')}"
+                   target="_blank"
+                   style="color:#5aaaff;font-weight:700;word-break:break-all">
+                  {flow.get('verification_uri','https://microsoft.com/devicelogin')}
+                </a>
+              </div>
+              <div style="margin:10px 0 6px;font-size:12px;color:var(--mu)">
+                <strong>Step 2</strong> — Enter this code:
+              </div>
+              <div style="background:var(--bg);border:1px solid var(--bd);border-radius:8px;
+                          padding:10px;font-family:'JetBrains Mono',monospace;font-size:18px;
+                          font-weight:700;color:var(--acc3);text-align:center;
+                          letter-spacing:.16em;margin-bottom:10px">
+                {flow.get('user_code','')}
+              </div>
+              <div class="od-hint">
+                <strong>Step 3</strong> — Sign in with your Microsoft / work account,
+                then click <strong>I've signed in</strong> below.
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            col_check, col_cancel = st.columns(2)
+            with col_check:
+                if st.button("✅ I've signed in", use_container_width=True):
+                    try:
+                        tok = ms_poll_token(flow["device_code"])
+                        if tok:
+                            # Get display name
+                            try:
+                                import requests as _req
+                                me = _req.get(f"{GRAPH}/me",
+                                              headers={"Authorization": f"Bearer {tok['access_token']}"},
+                                              timeout=10).json()
+                                st.session_state.ms_user = me.get("displayName", me.get("userPrincipalName", ""))
+                            except Exception:
+                                pass
+                            st.session_state.ms_token       = tok
+                            st.session_state.ms_device_flow = None
+                            st.success("✅ Signed in!")
+                            st.rerun()
+                        else:
+                            st.warning("⏳ Not authenticated yet — finish signing in, then try again.")
+                    except RuntimeError as e:
+                        st.error(f"Authentication failed: {e}")
+                        st.session_state.ms_device_flow = None
+            with col_cancel:
+                if st.button("✖ Cancel", use_container_width=True):
+                    st.session_state.ms_device_flow = None
+                    st.rerun()
+
+        # ── Not yet started — show sign-in button ──────────────────────────────
+        else:
+            st.markdown("""
+            <div class="od-panel">
+              <div class="od-title">☁️ SharePoint / OneDrive</div>
+              <div class="od-hint">
+                Sign in with your Microsoft work account to access SharePoint
+                document libraries and OneDrive folders directly.<br><br>
+                No Azure app registration required — uses your existing
+                Microsoft 365 credentials.
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            if st.button("🔐 Sign in with Microsoft", use_container_width=True):
+                with st.spinner("Starting sign-in…"):
+                    try:
+                        flow = ms_start_device_flow()
+                        if "user_code" in flow:
+                            st.session_state.ms_device_flow = flow
+                            st.rerun()
+                        else:
+                            st.error(f"Could not start sign-in: {flow.get('error_description', flow)}")
+                    except Exception as e:
+                        st.error(f"Sign-in error: {e}")
 
         # Show fetched file list
         if st.session_state.fetched_files:
-            st.markdown(f'<div style="font-size:12px;color:var(--mu);margin:8px 0 5px">Last fetched — <strong style="color:var(--tx)">{len(st.session_state.fetched_files)}</strong> file(s):</div>',
-                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="font-size:12px;color:var(--mu);margin:8px 0 5px">'
+                f'Last fetched — <strong style="color:var(--tx)">'
+                f'{len(st.session_state.fetched_files)}</strong> file(s):</div>',
+                unsafe_allow_html=True)
             for fname, fsize in st.session_state.fetched_files[:12]:
                 sz = f"{fsize // 1024:,} KB" if fsize else ""
                 st.markdown(
