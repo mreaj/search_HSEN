@@ -1,16 +1,24 @@
-# SharePoint PDF Document Search — Streamlit App
+# 🦺 HSE Notifications Assistant
 
-A dark-themed, production-ready Streamlit app that scans a SharePoint document library for PDFs matching event numbers, description keywords, or free text.
+A RAG chatbot for your HSE (Health, Safety & Environment) documents.
+Connects directly to an OneDrive / SharePoint shared folder link and lets your team
+ask natural-language questions across all safety notices and reports.
 
 ---
 
 ## Features
 
-- **Three search modes**: event numbers, keywords, or free text (or all combined)
-- **Live SharePoint connection** via Azure AD App-only credentials
-- **Download results** as Excel or CSV
-- **Direct links** to matched files in SharePoint
-- Match badge display showing exactly which terms were found
+| Capability | Detail |
+|---|---|
+| **OneDrive integration** | Paste a public shared folder link — files are fetched automatically |
+| **Manual upload fallback** | Drag-and-drop PDF / DOCX files directly |
+| **PDF parsing** | Text, embedded tables (as markdown grids), scanned pages (OCR) |
+| **DOCX parsing** | Paragraphs + table cells, structure preserved |
+| **Keyword highlighting** | Your search terms are highlighted in every answer |
+| **Source citations** | Every fact is attributed to its source document and page |
+| **Multi-doc synthesis** | Answers draw from all relevant documents simultaneously |
+| **Conversation memory** | Remembers the last 4 Q&A turns for follow-up questions |
+| **Follow-up suggestions** | 3 suggested follow-up questions after each answer |
 
 ---
 
@@ -22,25 +30,24 @@ A dark-themed, production-ready Streamlit app that scans a SharePoint document l
 pip install -r requirements.txt
 ```
 
-### 2. Register an Azure AD App (one-time admin setup)
+> **Tesseract** (for scanned PDF OCR) must be installed separately:
+> - **Ubuntu/Debian**: `sudo apt install tesseract-ocr`
+> - **macOS**: `brew install tesseract`
+> - **Windows**: [Download installer](https://github.com/UB-Mannheim/tesseract/wiki)
 
-1. Go to **Azure Portal → App registrations → New registration**
-2. Name it (e.g. `SharePoint Search App`), leave redirect URI blank
-3. Go to **API Permissions → Add a permission → SharePoint → Application permissions**
-4. Add `Sites.Read.All` → Grant admin consent
-5. Go to **Certificates & Secrets → New client secret** — copy the value immediately
-6. Note your **Application (client) ID** from the Overview page
+### 2. Get a Mistral AI API key
 
-### 3. Grant the app access to your SharePoint site
+Sign up free at [console.mistral.ai](https://console.mistral.ai), create an API key.
 
-Option A — SharePoint Admin Center:
-- Site settings → Site permissions → Share with the app
+### 3. Configure secrets (optional — recommended for deployment)
 
-Option B — PowerShell:
-```powershell
-Connect-PnPOnline -Url https://contoso.sharepoint.com/sites/YourSite -Interactive
-Grant-PnPAzureADAppSitePermission -AppId <your-client-id> -DisplayName "Search App" -Site <site-url> -Permissions Read
+Create `.streamlit/secrets.toml`:
+
+```toml
+MISTRAL_API_KEY = "your-mistral-key-here"
 ```
+
+Or set as environment variable: `export MISTRAL_API_KEY=your-key`
 
 ### 4. Run the app
 
@@ -48,37 +55,74 @@ Grant-PnPAzureADAppSitePermission -AppId <your-client-id> -DisplayName "Search A
 streamlit run app.py
 ```
 
-Then open http://localhost:8501 and enter your:
-- **Site URL** — e.g. `https://contoso.sharepoint.com/sites/Notifications`
-- **Client ID** — from Azure AD app registration
-- **Client Secret** — from Azure AD app secret
-- **Library Name** — the document library name (default: `Documents`)
+---
+
+## OneDrive / SharePoint Setup
+
+1. Navigate to your HSE documents folder in OneDrive or SharePoint
+2. Click **Share** → set permissions to **"Anyone with the link can view"**
+3. Click **Copy link**
+4. Paste the link into the sidebar of the app → click **Fetch & Index Files**
+
+The app will download all PDF and DOCX files from the folder and build a searchable index.
+
+### Re-syncing documents
+
+Click **Fetch & Index Files** again at any time to pull the latest files from OneDrive.
+The index is rebuilt fresh each time.
 
 ---
 
-## Deploying publicly (Streamlit Community Cloud)
+## Deploy to Streamlit Community Cloud
 
-1. Push this folder to a GitHub repo
-2. Go to [share.streamlit.io](https://share.streamlit.io) and connect your repo
-3. Set secrets in the Streamlit Cloud dashboard (optional — avoids entering credentials each time):
-
-```toml
-# .streamlit/secrets.toml (local dev only, never commit this)
-SHAREPOINT_SITE_URL = "https://contoso.sharepoint.com/sites/YourSite"
-SHAREPOINT_CLIENT_ID = "your-client-id"
-SHAREPOINT_CLIENT_SECRET = "your-client-secret"
-SHAREPOINT_LIBRARY = "Documents"
-```
-
-Then in `app.py`, pre-fill the sidebar inputs using `st.secrets` if available.
+1. Push this folder to a GitHub repository
+2. Go to [share.streamlit.io](https://share.streamlit.io) → New app
+3. Select your repo and set `app.py` as the entry point
+4. Under **Advanced settings → Secrets**, add:
+   ```toml
+   MISTRAL_API_KEY = "your-mistral-key-here"
+   ```
+5. Deploy!
 
 ---
 
-## File Structure
+## Example Questions
+
+- *What PPE is required for chemical handling?*
+- *List all emergency evacuation steps*
+- *What does the hot work permit require?*
+- *What inspection items are in the safety checklist?*
+- *Compare PPE requirements across all notices*
+- *What are the incident reporting procedures?*
+
+---
+
+## Architecture
 
 ```
-sharepoint_search_app/
-├── app.py              # Main Streamlit application
-├── requirements.txt    # Python dependencies
-└── README.md           # This file
+OneDrive Share Link
+        │
+        ▼
+  Graph API (anonymous shares endpoint)
+        │   downloads PDF / DOCX bytes
+        ▼
+  Document Parsers
+  ├── pdfplumber  → text + tables
+  ├── pdf2image + pytesseract  → OCR for scanned pages
+  └── python-docx  → paragraphs + tables
+        │
+        ▼
+  RecursiveCharacterTextSplitter  (1000 tokens, 200 overlap)
+        │
+        ▼
+  HuggingFace all-MiniLM-L6-v2  (embeddings, CPU)
+        │
+        ▼
+  ChromaDB  (in-memory vector store)
+        │
+        ▼  MMR retrieval + per-source gap fill
+  Mistral AI  (LLM answer generation)
+        │
+        ▼
+  Streamlit UI  (keyword highlight, source citations, follow-ups)
 ```
