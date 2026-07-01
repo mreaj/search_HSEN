@@ -1055,7 +1055,7 @@ with st.sidebar:
     # ════ MODE B: Manual upload ════════════════════════════════════════════════
     else:
         st.markdown(
-            '<div class="hint">📁 Upload PDF safety notices or Word reports directly.</div>',
+            '<div class="hint">📁 Upload PDF safety notifications or Word reports directly.</div>',
             unsafe_allow_html=True)
         uploaded = st.file_uploader(
             "files", accept_multiple_files=True,
@@ -1168,7 +1168,7 @@ if not st.session_state.messages:
     st.markdown("""
     <div class="welcome">
       <div class="wi">🦺</div>
-      <div class="wt">Ask anything about your HSE notices</div>
+      <div class="wt">Ask anything about your HSE notifications</div>
       <div class="wx">
         Paste your OneDrive share link in the sidebar — the bot fetches and indexes
         all your PDF and Word HSE documents automatically.<br><br>
