@@ -164,4 +164,3 @@ if st.button("Ask") and st.session_state.vs:
     with st.spinner("Thinking..."):
         answer = ask(st.session_state.vs, q)
     st.write(answer)
-``
