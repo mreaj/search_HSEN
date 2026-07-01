@@ -50,11 +50,24 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&family=JetBrains+Mono:wght@400;500&display=swap');
 :root{
-  --bg:#070a0f; --s1:#0d1219; --s2:#131b24; --s3:#18222e;
-  --bd:#1c2838; --bd2:#253345;
-  --g1:#00dfa8; --g2:#1a7aff;
-  --tx:#ccd8e8; --mu:#4d6070; --mu2:#2d3f50;
-  --ok:#22c55e; --wn:#f59e0b; --er:#ef4444;
+  --bg:#ffffff;        /* main background */
+  --s1:#ffffff;
+  --s2:#f7f9fc;
+  --s3:#eef2f7;
+
+  --bd:#e2e8f0;
+  --bd2:#cbd5e1;
+
+  --g1:#00a67e;
+  --g2:#2563eb;
+
+  --tx:#1e293b;
+  --mu:#64748b;
+  --mu2:#94a3b8;
+
+  --ok:#16a34a;
+  --wn:#d97706;
+  --er:#dc2626;
 }
 *{box-sizing:border-box;}
 html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--tx)!important;font-family:'DM Sans',sans-serif!important;}
@@ -828,34 +841,6 @@ with st.sidebar:
       <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;color:#ccd8e8">🦺 HSE Bot</div>
       <div style="font-size:10px;color:#4d6070;letter-spacing:.1em;text-transform:uppercase;margin-top:3px">Configuration</div>
     </div>""", unsafe_allow_html=True)
-    st.divider()
-
-    # ── Mistral API Key ────────────────────────────────────────────────────────
-    st.markdown('<span class="sl">Mistral AI API Key</span>', unsafe_allow_html=True)
-    stored_key  = _mistral_key()
-    if stored_key:
-        st.markdown('<div style="font-size:12px;color:#22c55e;margin-bottom:8px">✅ Key loaded from secrets</div>',
-                    unsafe_allow_html=True)
-        mistral_key = stored_key
-    else:
-        mistral_key = st.text_input("mk", type="password",
-                                    placeholder="Enter Mistral AI API key…",
-                                    label_visibility="collapsed")
-        st.markdown(
-            '<div class="apihint">🔑 Free key at <a href="https://console.mistral.ai" '
-            'target="_blank" style="color:#f59e0b;font-weight:700">console.mistral.ai</a></div>',
-            unsafe_allow_html=True)
-    st.divider()
-
-    # ── Model & tuning ─────────────────────────────────────────────────────────
-    st.markdown('<span class="sl">Model & Tuning</span>', unsafe_allow_html=True)
-    model_lbl   = st.selectbox("Model", list(MISTRAL_MODELS.keys()), index=0,
-                               label_visibility="collapsed")
-    model_name  = MISTRAL_MODELS[model_lbl]
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05,
-                            help="Lower = more precise and factual")
-    top_k       = st.slider("Top-K Sources", 2, 12, 6,
-                            help="Number of document chunks retrieved per question")
     st.divider()
 
     # ── Answer style ───────────────────────────────────────────────────────────
