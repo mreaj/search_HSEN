@@ -1,5 +1,5 @@
 """
-HSE Safety Notifications RAG Chatbot
+HSE Notifications Chatbot
 ─────────────────────────────────────────────────────────────────────────────
 Stack  : Mistral AI · LangChain · ChromaDB (in-memory) · Streamlit
 Source : OneDrive / SharePoint public shared-folder link  ← primary
